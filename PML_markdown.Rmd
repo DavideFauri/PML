@@ -1,0 +1,183 @@
+---
+title: "Practical Machine Learning Assignment"
+author: "Davide Fauri"
+date: "24 january 2015"
+output: html_document
+---
+
+## Data exploration
+
+The .csv file was initially read with a text editor, to have an initial guess on the type of data. A lot of variables were missing, either with missing values, or with `"NA"` and `"#DIV/0!"` strings.
+
+Following advice from [here](http://www.r-bloggers.com/using-r-common-errors-in-table-import/), I mapped all these values to `NA` while importing the data.
+
+```{r libraries, eval=TRUE, cache=TRUE, echo=FALSE, results='hide'}
+library(caret); library(Hmisc); library(randomForest);
+```
+
+```{r import, eval=TRUE, cache=TRUE, results='hide'}
+Data <- csv.get("pml-training.csv", na.strings=c("", "NA", "#DIV/0!"))
+Test <- csv.get("pml-testing.csv", na.strings=c("", "NA", "#DIV/0!"))
+```
+
+## Data cleaning
+
+Further exploration revealed a few "useless" predictors, i.e. timestamps, indices, and information about the time slices. Moreover, the second order statistics for some parameters were provided both in the form of standard deviations and of variances: the former were preferred, because they use the same units as the measured values[^1].
+
+[^1]: Actually, the random forest algorithm uses linear separation at each node, so a monotonic function like taking the square of the std. dev. does not offer additional information. 
+
+```{r clean, eval=TRUE, cache=TRUE}
+Data <- Data[,!grepl("X{1}|timestamp|window|var.(pi[ct]{2}h|yaw|roll)",names(Data))]
+Test <- Test[,!grepl("X{1}|timestamp|window|var.(pi[ct]{2}h|yaw|roll)",names(Test))]
+```
+
+Another simplification can be done by excluding the predictors with a small number of actual measurements: in this case, around 80 predictors had more than 90% missing data. A second pass with `nearZeroValues()` could not reduce further the dataset.
+
+```{r propNA, eval=TRUE, cache=TRUE, fig.width=5, fig.height=4}
+propNA = apply(is.na(Data),2,sum)/dim(Data)[1]
+hist(propNA)
+```
+
+The final predictors are:
+
+```{r, eval=TRUE, cache=TRUE}
+Data <- Data[,propNA<0.9]
+Test <- Test[,propNA<0.9]
+names(Data)
+```
+
+It's immediately evident how higher order statistics are absent from the cleaned dataset.
+
+## Model choice
+
+There are around 50 possible predictors, so model-based approaches might be too complicated to correctly guess; regression trees, on the other hand, might be better for classification but are impractical with too much predictors, both in computing time and in generalization error.
+
+One important parameter is `user.name`: depending on who's doing the weight lifting, the measured parameters for a 'correct' or `incorrect` exercise might vary dependently. Therefore, two approaches are here presented:
+
+(1) one will try to fit a random forest on the whole dataset, building a generalized tree that's independent of `user.name` and therefore adaptable to new athletes;
+(2) the other will fit a random forest for each user, using personalized data to improve prediction accuracy. In practice, this corresponds to forcing a top-level node to branch according on `user.name`, therefore adding a layer of depth to a single tree.
+
+In both cases, 4-fold cross validation will be performed to select the minimum number of features that still gives a good out-of-bag error.
+
+## Generalized tree
+
+As said before, user name was removed from the predictors, to avoid overfitting phenomena. The `rfcv()` function was extremely valuable to assess the ratio of expected error vs. number of parameters.
+
+```{r crossv1, eval=TRUE, cache=TRUE}
+objective = Data$classe
+predictors = Data[, !grepl("user.name|classe",names(Data))]
+
+# useful for debugging
+eigth <- createDataPartition(y=objective,p=0.125,list=FALSE)
+fourth <- createDataPartition(y=objective,p=0.25,list=FALSE)
+half <- createDataPartition(y=objective,p=0.5,list=FALSE)
+
+# (takes about 9 minutes on a MB Air)
+result <- rfcv(predictors[fourth,], objective[fourth], step=0.9, cv.fold=4)
+```
+
+Plotting the result (on a logarithmic scale for clarity), the optimal choice is to select 9 features at a time when building the trees: this eases computation, is robust to overfit and still maintains good accuracy. This result is also confirmed when weighing the cross validation error with the number of parameters.
+
+```{r, eval=TRUE, cache=TRUE}
+with(result, plot(n.var, error.cv, log="y", type="o", lwd=2))
+with(result, error.cv * n.var)
+```
+
+Having already set a bound on tree depth, construction is pretty straightforward. For computational reasons, only 50% of the dataset was used.
+
+```{r train1, eval=TRUE, cache=TRUE}
+rf_model <- randomForest(x=predictors[half,], y=objective[half], replace=FALSE , mtry=9,prox=TRUE,allowParallel=TRUE,importance=TRUE)
+```
+
+## Second model: personalized trees
+
+Data was split in six roughly equal datasets, one for each athlete:
+
+```{r split, eval=TRUE, cache=TRUE}
+splitted <- split(Data, Data$user.name)
+```
+
+4-fold cross validation was then performed six times, to check if different users require different model structures.
+
+```{r crossv2, eval=TRUE, cache=TRUE}
+objective_2 <- predictors_2 <- result_2 <- vector(mode="list", length=6)
+
+for (i in 1:6){
+
+  objective_2[[i]] <- splitted[[i]]$classe
+  predictors_2[[i]] <- splitted[[i]][, !grepl("user.name|classe",names(Data))]      # eliminate user name, classe
+  
+  result_2[[i]] <- rfcv(predictors_2[[i]], objective_2[[i]], step=0.9, cv.fold=4)
+  #with(result_2[[i]], print(error.cv * n.var))
+}
+```
+
+Comparing the generalized forest ("o" plot) to each personalized model, and also with their mean ("x" plot), two conclusions can be made:
+
+(1) unsurprisingly, accuracy improves slightly when the models are fitted for each user, even when each error is averaged between forests;
+(2) the number of features (9) selected before is still applicable, and is often the very best choice for many subsets. For this reason, it was chosen for all models. [^2]
+
+[^2]: this of course means that the whole "global" model uses 10 features.
+
+```{r compare, eval=TRUE, cache=TRUE, fig.width=5, fig.height=4}
+
+colors<- rainbow(6)
+with(result, plot(n.var, error.cv, log="x", type="o", lwd=3))
+for (i in 1:6){
+  with(result_2[[i]], lines(n.var, error.cv, col=colors[i], lwd=1.5, type="o"))
+  }
+
+err_sum <- vector(mode="numeric", length=length(result_2[[1]]$error.cv))
+for (i in 1:6){
+  err_sum = err_sum + result_2[[i]]$error.cv
+  }
+lines(result$n.var, err_sum/6, lwd=1.2, type="o", pch="x")
+```
+
+Again, forest construction is easy.
+
+```{r train2, eval=TRUE, cache=TRUE}
+
+# create random forests (should take ~2 minutes)
+rf_model_2 <- vector(mode="list", length=6)
+for(i in 1:6){
+  rf_model_2[[i]] <- randomForest(x=predictors_2[[i]], y=objective_2[[i]], replace=FALSE , mtry=9,prox=TRUE,allowParallel=TRUE,importance=TRUE)
+}
+```
+
+## Test set evaluation
+
+Before inputting the test set to the `predict()` function, I did a sanity check to verify that all the variables used when building the models were present.
+
+```{r check, eval=TRUE, cache=TRUE}
+testing = Test[,!grepl("user.name|problem.id",names(Test))]
+all(names(predictors)==names(testing))
+```
+
+The `Test` data frame was then fed to the generalized forest model,
+
+```{r, eval=TRUE, cache=TRUE}
+answers <- predict(rf_model, Test)
+```
+
+as well to each personalized model. A small hack was necessary to select the appropriate forest for each test case.
+
+```{r test, eval=TRUE, cache=TRUE}
+answers_2 <- vector(mode= "integer", length = length(answers))
+my_factors = c("adelmo", "carlitos", "charles", "eurico", "jeremy", "pedro")
+
+answers_2 = factor(levels=c("A","B","C","D","E"))
+for (i in 1:6){
+  which_user = Test$user.name == my_factors[i]
+  answers_2[which_user] <- predict(rf_model_2[[i]], Test[which_user,])
+}
+```
+
+As a final sanity check, I verified that the predictions from the two models coincide in all cases, giving a perfect 100% score when submitting. Still, the second technique is considerably faster and more precise.
+
+```{r, eval=TRUE, cache=TRUE}
+all(answers == answers_2)
+answers
+```
+
+
